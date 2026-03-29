@@ -1,6 +1,6 @@
 # tdupes
 
-Find, review, and safely trash exact and near-duplicate files on Linux.
+Smartly find, review, and safely trash exact and near-duplicate files on Linux.
 
 `tdupes` detects **exact duplicates** (byte-identical, via `fdupes`) and
 optionally **near-duplicates** (same basename, scored by content similarity, via
@@ -18,8 +18,9 @@ Key features:
   proposed to be deleted by default
 * Preferred dirs and exclusion patterns can be specified by config file
   or via `-p`/`-x` flags upon execution
-* Interactive action plan editing (TSV opened with `xdg-open`) or fully
-  automated batch mode (with the TSV merely as the log)
+* Prepares a smart action plan to a TSV table and allows its interactive
+  editing with your favourite spreadsheet tool (TSV opened with `xdg-open`)
+* Automated batch mode also available (the TSV serves then as a log)
 
 ## Install
 
@@ -86,7 +87,7 @@ On first run `tdupes` creates `$XDG_CONFIG_HOME/tdupes.yml` (defaults to
 `~/.config/tdupes.yml`):
 
 ```yaml
-preferred_directories: []   # files here are never marked DELETE
+preferred_directories: []   # files here are never proposed to be deleted
 verbosity: 1                # 0=quiet, 1=normal, 2=verbose
 tsv_output: null            # null = temp file each run
 exclusion_patterns: []      # shell glob patterns to skip
