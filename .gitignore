@@ -1,0 +1,24 @@
+# Build outputs
+dist/
+build/
+*.egg-info/
+
+# Byte-compiled
+__pycache__/
+*.py[cod]
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+htmlcov/
+.coverage
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Dev artifacts
+prompt.txt
