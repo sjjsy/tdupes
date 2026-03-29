@@ -11,8 +11,8 @@ irrecoverably lost until the bin is emptied.
 Features
 --------
 * Exact-duplicate detection via fdupes (byte-identical, any mix of files/dirs)
-* Near-duplicate detection via -L (same basename, scored by similarity)
-* Preferred-directory protection: files inside preferred dirs are never proposed to be deleted by default
+* Basename-match detection via -L (same basename, scored by similarity; kept by default)
+* Preferred-directory protection: files inside preferred dirs are never proposed for deletion
 * Exclusion patterns: skip files matching shell glob patterns
 * Interactive review: TSV opened with xdg-open; edit Action column, then confirm
 * Batch mode: no prompts, immediate execution (suitable for scripting/cron)
@@ -89,6 +89,22 @@ def check_dependencies(need_locate: bool) -> list[str]:
     return missing
 
 
+# ── System preferred directories ──────────────────────────────────────────────
+
+_SYSTEM_PREFER_EXCLUDE = frozenset(["/home", "/tmp"])
+
+
+def _default_system_preferred() -> list[str]:
+    """Return all top-level directories at / except /home and /tmp."""
+    try:
+        return sorted(
+            str(p) for p in Path("/").iterdir()
+            if p.is_dir() and str(p) not in _SYSTEM_PREFER_EXCLUDE
+        )
+    except OSError:
+        return []
+
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG: dict = {
@@ -104,6 +120,10 @@ _CONFIG_HEADER = """\
 #
 # preferred_directories  - list of directory paths; files inside are never
 #                          recommended for deletion.
+#                          On first run, defaults to all top-level system
+#                          directories at / (excluding /home and /tmp).
+#                          Use -s/-S at runtime to add/remove system dirs
+#                          for a single run; use -r DIR to remove one dir.
 # verbosity              - 0=quiet, 1=normal, 2=verbose
 # tsv_output             - absolute path for TSV output file, or null (temp)
 # exclusion_patterns     - shell glob patterns matched against full file paths;
@@ -126,9 +146,10 @@ def load_config(override: Path | None = None) -> dict:
 
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
+        cfg["preferred_directories"] = _default_system_preferred()
         with path.open("w") as fh:
             fh.write(_CONFIG_HEADER)
-            yaml.dump(DEFAULT_CONFIG, fh, default_flow_style=False)
+            yaml.dump(cfg, fh, default_flow_style=False)
         print(f"[tdupes] Created default config at {path}")
         print("[tdupes] Edit preferred_directories and other options as needed.\n")
         return cfg
@@ -347,25 +368,15 @@ def _fsize(path: Path) -> int:
     return st.st_size if st else 0
 
 
-def _near_dupe_keep_set(paths: list[Path], preferred: list[str]) -> set[Path]:
-    """
-    Determine which paths to keep in a near-dupe group.
-    All preferred-directory files are kept.
-    Among non-preferred files, keep the largest by size AND the newest by mtime
-    ONLY if no preferred file already holds that distinction (i.e. if a preferred
-    file is already the overall largest, no extra non-preferred keeper is added for
-    size; likewise for mtime). They may resolve to the same file.
-    """
-    pref = {p for p in paths if _in_preferred(p, preferred)}
-    keep = set(pref)
-    if paths:
-        largest_overall = max(paths, key=_fsize)
-        newest_overall  = max(paths, key=_mtime)
-        if largest_overall not in pref:
-            keep.add(largest_overall)
-        if newest_overall not in pref:
-            keep.add(newest_overall)
-    return keep
+def _sim_flagged_delete(sim: str, delete_xxx: bool, delete_nnn: bool, delete_excl: bool) -> bool:
+    """Return True if this similarity code should be DELETE given the active flags."""
+    if sim == "XXX":
+        return delete_xxx
+    if sim == "!!!":
+        return delete_excl
+    if sim not in ("XXX", "!!!", "100"):  # NNN% text match
+        return delete_nnn
+    return False
 
 
 def apply_exclusions(groups: list[list[Path]], patterns: list[str]) -> list[list[Path]]:
@@ -431,15 +442,30 @@ def build_near_dupe_groups(
     locate_map: dict[Path, list[Path]],
     fdupes_groups: list[list[Path]],
     preferred: list[str],
+    delete_xxx: bool = False,
+    delete_nnn: bool = False,
+    delete_excl: bool = False,
+    heuristic_a: bool = False,
+    heuristic_b: bool = False,
 ) -> list[list[FileEntry]]:
     """
-    Build TSV groups for near-duplicates found with -L.
+    Build TSV groups for basename matches found with -L.
     For each CLI file, locate matches that are NOT already exact duplicates of it
     (per fdupes) are collected into a group and given real similarity codes.
-    The keep/DELETE action uses the near-dupe rule: keep preferred-dir files,
-    and among the rest keep the largest AND the newest (possibly the same file).
+
+    Default action: keep all files.
+    Preferred-directory files are always kept regardless of any flag.
+
+    Heuristics (heuristic_a / heuristic_b) elect a subset of non-preferred files
+    to keep; all non-preferred files NOT elected by any active heuristic get DELETE.
+    When no heuristic is active the default keep-all applies.
+    Multiple heuristics combine by union: a file kept by any one of them survives.
+
+    Delete flags (delete_xxx / delete_nnn / delete_excl) additionally DELETE
+    non-preferred files by similarity code when no heuristic selected them.
+    (Files elected by a heuristic are immune to delete flags; preferred files
+    are immune to everything.)
     """
-    # Map each path → frozenset of its exact-dupe companions (including itself)
     exact_group_of: dict[Path, frozenset[Path]] = {}
     for group in fdupes_groups:
         fs = frozenset(group)
@@ -461,23 +487,37 @@ def build_near_dupe_groups(
         # CLI file first; remaining sorted newest → oldest
         near.sort(key=_mtime, reverse=True)
         ordered = [cli_file] + near
-
-        # Compute keep set and identify which file earns each keep tag.
-        # Largest/newest non-preferred keepers are only added when no preferred
-        # file already holds that distinction across the whole group.
         pref_set = {p for p in ordered if _in_preferred(p, preferred)}
-        keep_set = set(pref_set)
 
-        largest_overall = max(ordered, key=_fsize)
-        newest_overall  = max(ordered, key=_mtime)
+        # ── Heuristic keep sets and per-file reason tags ───────────────────────
+        heuristic_keepers: set[Path] = set()
+        heuristic_reasons: dict[Path, list[str]] = {p: [] for p in ordered}
+        any_heuristic = heuristic_a or heuristic_b
 
-        largest_np = largest_overall if largest_overall not in pref_set else None
-        newest_np  = newest_overall  if newest_overall  not in pref_set else None
+        if heuristic_a:
+            # Keep the overall largest non-preferred file and the overall newest,
+            # but only when no preferred file already covers that distinction.
+            largest = max(ordered, key=_fsize)
+            newest  = max(ordered, key=_mtime)
+            largest_np = largest if largest not in pref_set else None
+            newest_np  = newest  if newest  not in pref_set else None
+            if largest_np:
+                heuristic_keepers.add(largest_np)
+                heuristic_reasons[largest_np].append("largest in basename group")
+            if newest_np:
+                heuristic_keepers.add(newest_np)
+                heuristic_reasons[newest_np].append("newest in basename group")
 
-        if largest_np:
-            keep_set.add(largest_np)
-        if newest_np:
-            keep_set.add(newest_np)
+        if heuristic_b:
+            # Keep non-preferred file(s) at the shallowest directory depth.
+            # Ties (same depth) are all kept.
+            non_pref = [p for p in ordered if p not in pref_set]
+            if non_pref:
+                min_depth = min(len(p.parts) for p in non_pref)
+                for p in non_pref:
+                    if len(p.parts) == min_depth:
+                        heuristic_keepers.add(p)
+                        heuristic_reasons[p].append("shallowest path in group")
 
         entries: list[FileEntry] = []
         for i, path in enumerate(ordered):
@@ -488,17 +528,22 @@ def build_near_dupe_groups(
                 if st else ""
             )
             sim = "100" if i == 0 else similarity_code(cli_file, path)
-            action = "keep" if path in keep_set else "DELETE"
+            in_pref = path in pref_set
+
+            if in_pref:
+                action = "keep"
+            elif any_heuristic and path not in heuristic_keepers:
+                action = "DELETE"
+            elif _sim_flagged_delete(sim, delete_xxx, delete_nnn, delete_excl):
+                action = "DELETE"
+            else:
+                action = "keep"
 
             reasons: list[str] = []
-            if path in pref_set:
+            if in_pref:
                 reasons.append("in preferred folder")
-            if path is largest_np:
-                reasons.append("largest in basename group")
-            if path is newest_np:
-                reasons.append("newest in basename group")
+            reasons.extend(heuristic_reasons.get(path, []))
             comment = ", ".join(reasons)
-
             entries.append(FileEntry(action, sim, size_kb, modified, path, comment))
 
         out.append(entries)
@@ -528,7 +573,7 @@ def write_tsv(
         fh.write("\t".join(HEADER) + "\n")
         _write_groups(fh, groups, first_group=True)
         if near_dupe_groups:
-            fh.write("\n#\t\t\t\tNEAR-DUPLICATES — same basename, not byte-identical\n")
+            fh.write("\n#\t\t\t\tBASENAME MATCHES — same basename, not byte-identical\n")
             _write_groups(fh, near_dupe_groups, first_group=True)
 
 
@@ -561,7 +606,7 @@ def _parse_tsv_for_display(
             continue
         if line.startswith("Action\t"):
             continue
-        if line.startswith("#\t\t\t\tNEAR-DUPLICATES"):
+        if line.startswith("#\t\t\t\tBASENAME MATCHES"):
             flush(exact_groups)
             in_near = True
             continue
@@ -708,13 +753,22 @@ def build_parser() -> argparse.ArgumentParser:
             "    Note: CLI argument files are listed first so they are never the\n"
             "          last-in-group tiebreaker and are therefore DELETE by default.\n"
             "\n"
-            "  Near-duplicate groups (-L, same basename, not byte-identical):\n"
-            "    keep   — file is in a preferred_directories folder  [comment: in preferred folder]\n"
-            "    keep   — overall largest, only if not already preferred  [comment: largest in basename group]\n"
-            "    keep   — overall newest,  only if not already preferred  [comment: newest in basename group]\n"
-            "    DELETE — everything else (CLI argument files go first; may be DELETE'd)\n"
-            "    Note: if a preferred file is already the largest (or newest) across\n"
-            "          the whole group, no extra non-preferred copy is kept for that reason.\n"
+            "  Basename match groups (-L, same basename, not byte-identical):\n"
+            "    keep   — all files by default\n"
+            "    keep   — always, when in a preferred_directories folder  [comment: in preferred folder]\n"
+            "    Heuristics — elect which non-preferred files to keep; the rest get DELETE:\n"
+            "               -A  →  keep overall largest + overall newest non-preferred file(s)\n"
+            "                       [comment: largest/newest in basename group]\n"
+            "               -B  →  keep non-preferred file(s) at the shallowest path depth\n"
+            "                       (fewest directory components; ties all kept)\n"
+            "                       [comment: shallowest path in group]\n"
+            "               Multiple heuristics union their keep sets.\n"
+            "    Delete flags — additionally DELETE non-preferred files by similarity type\n"
+            "               (only applies to files not elected by a heuristic):\n"
+            "               -X  →  XXX  binary files of equal size\n"
+            "               -N  →  NNN  text files, N%% similar via difflib\n"
+            "               -Z  →  !!!  binary files of different size\n"
+            "    Preferred-directory files are never deleted regardless of any flag.\n"
             "\n"
             "The Comment column in the TSV explains each keep decision.\n"
             "You can override any Action cell before confirming execution."
@@ -724,8 +778,10 @@ def build_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  tdupes ~/Pictures ~/Downloads\n"
             "  tdupes -l ~/Downloads/photo.jpg ~/Pictures\n"
-            "  tdupes -L ~/Downloads/photo.jpg ~/Pictures   # include near-dupes\n"
-            "  tdupes -b ~/Documents                        # batch mode, no prompts\n"
+            "  tdupes -L ~/Downloads/photo.jpg ~/Pictures     # basename matches\n"
+            "  tdupes -L -X -Z ~/Downloads/photo.jpg ~/Pictures  # delete binary matches\n"
+            "  tdupes -s ~/Documents                          # add system dirs as preferred\n"
+            "  tdupes -b ~/Documents                          # batch mode, no prompts\n"
             "  tdupes -t /tmp/review.tsv ~/Music\n"
             "\n"
             "Config: $XDG_CONFIG_HOME/tdupes.yml  (created automatically on first run)\n"
@@ -749,8 +805,8 @@ def build_parser() -> argparse.ArgumentParser:
         dest="locate_all",
         help=(
             "Like -l, but also tabulate locate matches that are not byte-identical "
-            "to the CLI file (near-duplicates). Among non-preferred-dir files in each "
-            "near-dupe group, keeps both the largest and the newest; deletes the rest."
+            "to the CLI file as 'basename matches'.  All such matches are kept by "
+            "default; use -X / -N / -Z to delete by similarity type."
         ),
     )
     parser.add_argument(
@@ -804,6 +860,83 @@ def build_parser() -> argparse.ArgumentParser:
             "May be repeated: -x '*.tmp' -x '/mnt/*'"
         ),
     )
+    parser.add_argument(
+        "-r", "--remove-prefer",
+        metavar="DIR",
+        action="append",
+        dest="remove_prefer",
+        help=(
+            "Remove DIR from preferred directories for this run, overriding config "
+            "and -p.  Repeatable: -r ~/Archive -r ~/OldBackups"
+        ),
+    )
+    parser.add_argument(
+        "-s", "--system-prefer",
+        action="store_true",
+        dest="system_prefer",
+        help=(
+            "Add all top-level system directories at / (excluding /home and /tmp) "
+            "to preferred dirs for this run.  Additive with config and -p."
+        ),
+    )
+    parser.add_argument(
+        "-S", "--no-system-prefer",
+        action="store_true",
+        dest="no_system_prefer",
+        help=(
+            "Remove the top-level system directories from preferred dirs for this "
+            "run (useful when they are in config but you want to scan freely)."
+        ),
+    )
+    parser.add_argument(
+        "-X", "--delete-xxx",
+        action="store_true",
+        dest="delete_xxx",
+        help=(
+            "In basename match groups (-L): DELETE non-preferred files with "
+            "similarity XXX (binary, equal size, not byte-identical)."
+        ),
+    )
+    parser.add_argument(
+        "-N", "--delete-nnn",
+        action="store_true",
+        dest="delete_nnn",
+        help=(
+            "In basename match groups (-L): DELETE non-preferred files with "
+            "similarity NNN (text files, partial %% match)."
+        ),
+    )
+    parser.add_argument(
+        "-Z", "--delete-excl",
+        action="store_true",
+        dest="delete_excl",
+        help=(
+            "In basename match groups (-L): DELETE non-preferred files with "
+            "similarity !!! (binary, different size)."
+        ),
+    )
+    parser.add_argument(
+        "-A", "--heuristic-a",
+        action="store_true",
+        dest="heuristic_a",
+        help=(
+            "In basename match groups (-L): keep the overall largest and the "
+            "overall newest non-preferred files; DELETE the rest.  If a preferred "
+            "file is already the overall largest (or newest), no extra non-preferred "
+            "copy is kept for that reason.  [comment: largest/newest in basename group]"
+        ),
+    )
+    parser.add_argument(
+        "-B", "--heuristic-b",
+        action="store_true",
+        dest="heuristic_b",
+        help=(
+            "In basename match groups (-L): keep non-preferred file(s) at the "
+            "shallowest directory depth (fewest path components); DELETE the rest.  "
+            "Tied-depth files are all kept.  Combines with -A: files elected by "
+            "either heuristic survive.  [comment: shallowest path in group]"
+        ),
+    )
 
     return parser
 
@@ -842,8 +975,20 @@ def main() -> None:
         _verbosity = cfg.get("verbosity", NORMAL)
 
     batch_mode: bool = args.batch or bool(cfg.get("batch_mode", False))
-    preferred_dirs: list[str] = list(cfg.get("preferred_directories") or []) + list(args.prefer or [])
     exclusion_patterns: list[str] = list(cfg.get("exclusion_patterns") or []) + list(args.exclude or [])
+
+    # Build effective preferred_directories: config + -p, then -s/-S adjustments, then -r removals
+    system_dirs = _default_system_preferred()
+    preferred_dirs: list[str] = list(cfg.get("preferred_directories") or []) + list(args.prefer or [])
+    if args.system_prefer:
+        existing = set(preferred_dirs)
+        preferred_dirs += [d for d in system_dirs if d not in existing]
+    if args.no_system_prefer:
+        system_set = set(system_dirs)
+        preferred_dirs = [d for d in preferred_dirs if d not in system_set]
+    for r in (args.remove_prefer or []):
+        r_res = str(Path(r).resolve())
+        preferred_dirs = [d for d in preferred_dirs if str(Path(d).resolve()) != r_res]
 
     # Resolve input paths
     input_paths: list[Path] = []
@@ -890,7 +1035,12 @@ def main() -> None:
     near_dupe_groups: list[list[FileEntry]] = []
     if args.locate_all and locate_map:
         near_dupe_groups = build_near_dupe_groups(
-            cli_files, locate_map, fdupes_groups, preferred_dirs
+            cli_files, locate_map, fdupes_groups, preferred_dirs,
+            delete_xxx=args.delete_xxx,
+            delete_nnn=args.delete_nnn,
+            delete_excl=args.delete_excl,
+            heuristic_a=args.heuristic_a,
+            heuristic_b=args.heuristic_b,
         )
 
     if not fdupes_groups and not near_dupe_groups:
@@ -900,7 +1050,7 @@ def main() -> None:
     if fdupes_groups:
         vprint(f"Found {len(fdupes_groups)} exact-duplicate group(s).", NORMAL)
     if near_dupe_groups:
-        vprint(f"Found {len(near_dupe_groups)} near-duplicate group(s).", NORMAL)
+        vprint(f"Found {len(near_dupe_groups)} basename match group(s).", NORMAL)
 
     # Build TSV model for exact duplicates
     tsv_groups = build_tsv_groups(fdupes_groups, cli_files, preferred_dirs)
@@ -926,7 +1076,7 @@ def main() -> None:
         if tsv_groups:
             print_tsv_table(tsv_groups, title="Exact duplicates:")
         if near_dupe_groups:
-            print_tsv_table(near_dupe_groups, title="\nNear-duplicates (same basename, not byte-identical):")
+            print_tsv_table(near_dupe_groups, title="\nBasename matches (same name, not byte-identical):")
         print()
 
     all_actions = read_tsv(tsv_path)
@@ -967,7 +1117,7 @@ def main() -> None:
         if edited_exact:
             print_tsv_table(edited_exact, title="Exact duplicates (after edits):")
         if edited_near:
-            print_tsv_table(edited_near, title="\nNear-duplicates (after edits):")
+            print_tsv_table(edited_near, title="\nBasename matches (after edits):")
 
     print()
     print("── Updated plan ─────────────────────────────────────────────")

@@ -18,10 +18,11 @@ import yaml
 
 from tdupes.__main__ import (
     DEFAULT_CONFIG,
+    _default_system_preferred,
     _fsize,
     _in_preferred,
     _mtime,
-    _near_dupe_keep_set,
+    _sim_flagged_delete,
     _tally,
     apply_exclusions,
     build_near_dupe_groups,
@@ -62,7 +63,10 @@ def test_load_config_creates_default(tmp_path: Path):
     path = tmp_path / "new.yml"
     result = load_config(path)
     assert path.exists(), "config file should be created"
-    assert result["preferred_directories"] == []
+    # On first run preferred_directories is pre-populated with system dirs
+    assert isinstance(result["preferred_directories"], list)
+    assert "/home" not in result["preferred_directories"]
+    assert "/tmp" not in result["preferred_directories"]
     assert result["batch_mode"] is False
 
 
@@ -506,128 +510,61 @@ def test_comment_column_cli_file_has_no_comment_when_deleted(tmp_path: Path):
     assert "last in group" in by_path[other].comment
 
 
-def test_comment_column_near_dupe_largest_and_newest(tmp_path: Path):
-    """build_near_dupe_groups populates largest/newest comments correctly."""
-    now = time.time()
-    cli   = make_file(tmp_path / "cli.txt",   "a" * 10,  mtime=now - 200)
-    large = make_file(tmp_path / "large.txt", "b" * 300, mtime=now - 100)
-    new_  = make_file(tmp_path / "new.txt",   "c" * 50,  mtime=now)
+def test_comment_column_near_dupe_default_no_comment(tmp_path: Path):
+    """Without flags, all basename matches are kept and have no comment."""
+    cli   = make_file(tmp_path / "cli.txt",   "a" * 10)
+    other = make_file(tmp_path / "other.txt", "b" * 300)
 
     groups = build_near_dupe_groups(
         cli_files={cli},
-        locate_map={cli: [large, new_]},
+        locate_map={cli: [other]},
         fdupes_groups=[],
         preferred=[],
     )
-    by_path = {e.path: e.comment for e in groups[0]}
-    assert by_path[cli] == ""                            # cli is smallest/oldest → no keep reason
-    assert "largest in basename group" in by_path[large]
-    assert "newest in basename group"  in by_path[new_]
+    for e in groups[0]:
+        assert e.action == "keep"
+        assert e.comment == ""
 
 
-def test_comment_column_near_dupe_winner_gets_both_tags(tmp_path: Path):
-    """When one file is both largest and newest it gets both tags."""
-    now = time.time()
-    cli    = make_file(tmp_path / "cli.txt",    "x" * 10,  mtime=now - 200)
-    winner = make_file(tmp_path / "winner.txt", "x" * 500, mtime=now)
-
-    groups = build_near_dupe_groups(
-        cli_files={cli},
-        locate_map={cli: [winner]},
-        fdupes_groups=[],
-        preferred=[],
-    )
-    winner_comment = next(e.comment for e in groups[0] if e.path == winner)
-    assert "largest in basename group" in winner_comment
-    assert "newest in basename group"  in winner_comment
-
-
-# ── Unit: _near_dupe_keep_set ─────────────────────────────────────────────────
-
-def test_near_dupe_keep_set_keeps_largest_and_newest(tmp_path: Path):
-    now = time.time()
-    large_old  = make_file(tmp_path / "large_old.bin",  "x" * 300, mtime=now - 200)
-    small_new  = make_file(tmp_path / "small_new.bin",  "x" * 10,  mtime=now)
-    middle_mid = make_file(tmp_path / "middle_mid.bin", "x" * 100, mtime=now - 100)
-
-    keep = _near_dupe_keep_set([large_old, small_new, middle_mid], preferred=[])
-    assert large_old in keep   # largest
-    assert small_new in keep   # newest
-    assert middle_mid not in keep
-
-
-def test_near_dupe_keep_set_single_file(tmp_path: Path):
-    f = make_file(tmp_path / "f.txt", "x")
-    keep = _near_dupe_keep_set([f], preferred=[])
-    assert f in keep
-
-
-def test_near_dupe_keep_set_preferred_always_kept(tmp_path: Path):
+def test_comment_column_near_dupe_preferred_comment(tmp_path: Path):
+    """Preferred files get 'in preferred folder' comment; others get no comment."""
     pref_dir = tmp_path / "pref"
     pref_dir.mkdir()
     pref_file = make_file(pref_dir / "f.txt", "x" * 10)
-    large     = make_file(tmp_path / "large.txt", "x" * 500)
+    other     = make_file(tmp_path / "other.txt", "y" * 50)
 
-    keep = _near_dupe_keep_set([pref_file, large], preferred=[str(pref_dir)])
-    assert pref_file in keep
-    assert large in keep   # largest among non-preferred
-
-
-def test_near_dupe_keep_set_same_file_is_largest_and_newest(tmp_path: Path):
-    now = time.time()
-    winner = make_file(tmp_path / "winner.txt", "x" * 500, mtime=now)
-    loser  = make_file(tmp_path / "loser.txt",  "x" * 10,  mtime=now - 100)
-
-    keep = _near_dupe_keep_set([winner, loser], preferred=[])
-    assert winner in keep
-    assert loser not in keep
-
-
-def test_near_dupe_keep_set_preferred_is_largest_no_extra_size_keeper(tmp_path: Path):
-    """If the overall largest is a preferred file, no extra non-preferred keeper for size."""
-    now = time.time()
-    pref_dir = tmp_path / "pref"
-    pref_dir.mkdir()
-    pref_big  = make_file(pref_dir / "big.txt",   "x" * 500, mtime=now - 200)  # largest, preferred
-    non_small = make_file(tmp_path / "small.txt",  "x" * 10,  mtime=now - 100)  # not largest
-    non_new   = make_file(tmp_path / "newest.txt", "x" * 50,  mtime=now)        # newest, not preferred
-
-    keep = _near_dupe_keep_set([pref_big, non_small, non_new], preferred=[str(pref_dir)])
-    assert pref_big  in keep           # preferred → always kept
-    assert non_new   in keep           # overall newest is non-preferred → kept
-    assert non_small not in keep       # not largest overall, not newest overall
-
-
-def test_near_dupe_keep_set_preferred_is_newest_no_extra_time_keeper(tmp_path: Path):
-    """If the overall newest is a preferred file, no extra non-preferred keeper for time."""
-    now = time.time()
-    pref_dir = tmp_path / "pref"
-    pref_dir.mkdir()
-    pref_new  = make_file(pref_dir / "new.txt",   "x" * 10,  mtime=now)         # newest, preferred
-    non_old   = make_file(tmp_path / "old.txt",    "x" * 10,  mtime=now - 200)   # not newest
-    non_large = make_file(tmp_path / "large.txt",  "x" * 500, mtime=now - 100)   # largest, not preferred
-
-    keep = _near_dupe_keep_set([pref_new, non_old, non_large], preferred=[str(pref_dir)])
-    assert pref_new  in keep           # preferred → always kept
-    assert non_large in keep           # overall largest is non-preferred → kept
-    assert non_old   not in keep       # not largest, not newest overall
-
-
-def test_near_dupe_keep_set_preferred_covers_both_no_extra_keepers(tmp_path: Path):
-    """If preferred files are both the largest and newest, no non-preferred file is kept."""
-    now = time.time()
-    pref_dir = tmp_path / "pref"
-    pref_dir.mkdir()
-    pref_big = make_file(pref_dir / "big.txt", "x" * 500, mtime=now - 100)   # largest
-    pref_new = make_file(pref_dir / "new.txt", "x" * 10,  mtime=now)         # newest
-    non_pref = make_file(tmp_path / "mid.txt", "x" * 50,  mtime=now - 200)   # neither
-
-    keep = _near_dupe_keep_set(
-        [pref_big, pref_new, non_pref], preferred=[str(pref_dir)]
+    groups = build_near_dupe_groups(
+        cli_files={pref_file},
+        locate_map={pref_file: [other]},
+        fdupes_groups=[],
+        preferred=[str(pref_dir)],
     )
-    assert pref_big in keep
-    assert pref_new in keep
-    assert non_pref not in keep        # covered on both dimensions by preferred files
+    by_path = {e.path: e for e in groups[0]}
+    assert by_path[pref_file].comment == "in preferred folder"
+    assert by_path[other].comment == ""
+
+
+# ── Unit: _sim_flagged_delete ─────────────────────────────────────────────────
+
+def test_sim_flagged_delete_xxx():
+    assert _sim_flagged_delete("XXX", delete_xxx=True,  delete_nnn=False, delete_excl=False)
+    assert not _sim_flagged_delete("XXX", delete_xxx=False, delete_nnn=False, delete_excl=False)
+
+
+def test_sim_flagged_delete_nnn():
+    assert _sim_flagged_delete("075", delete_xxx=False, delete_nnn=True,  delete_excl=False)
+    assert _sim_flagged_delete("000", delete_xxx=False, delete_nnn=True,  delete_excl=False)
+    assert not _sim_flagged_delete("075", delete_xxx=False, delete_nnn=False, delete_excl=False)
+
+
+def test_sim_flagged_delete_excl():
+    assert _sim_flagged_delete("!!!", delete_xxx=False, delete_nnn=False, delete_excl=True)
+    assert not _sim_flagged_delete("!!!", delete_xxx=False, delete_nnn=False, delete_excl=False)
+
+
+def test_sim_flagged_delete_100_never_deleted():
+    """Similarity '100' (exact match reference) is never flagged for deletion."""
+    assert not _sim_flagged_delete("100", delete_xxx=True, delete_nnn=True, delete_excl=True)
 
 
 # ── Unit: build_near_dupe_groups ──────────────────────────────────────────────
@@ -705,7 +642,8 @@ def test_build_near_dupe_groups_similarity_code_not_100(tmp_path: Path):
     assert by_path[near].similarity != "100"     # near-dupe gets real code
 
 
-def test_build_near_dupe_groups_keep_logic_largest_and_newest(tmp_path: Path):
+def test_build_near_dupe_groups_default_all_kept(tmp_path: Path):
+    """Without flags, all files in a basename match group are kept."""
     now = time.time()
     cli   = make_file(tmp_path / "cli.txt",   "a" * 10,  mtime=now - 200)
     large = make_file(tmp_path / "large.txt", "b" * 300, mtime=now - 100)
@@ -718,9 +656,9 @@ def test_build_near_dupe_groups_keep_logic_largest_and_newest(tmp_path: Path):
         preferred=[],
     )
     by_path = {e.path: e.action for e in groups[0]}
-    assert by_path[large] == "keep"   # largest
-    assert by_path[new_]  == "keep"   # newest
-    assert by_path[cli]   == "DELETE" # cli is neither largest nor newest
+    assert by_path[cli]   == "keep"
+    assert by_path[large] == "keep"
+    assert by_path[new_]  == "keep"
 
 
 def test_build_near_dupe_groups_preferred_kept_regardless(tmp_path: Path):
@@ -739,30 +677,24 @@ def test_build_near_dupe_groups_preferred_kept_regardless(tmp_path: Path):
     assert by_path[pref_file] == "keep"   # preferred, always kept
 
 
-def test_build_near_dupe_groups_preferred_is_largest_no_comment_on_non_pref(tmp_path: Path):
-    """When the preferred file is also the overall largest, non-preferred files get
-    no 'largest in basename group' tag and may be DELETE'd if they're not newest."""
-    now = time.time()
+def test_build_near_dupe_groups_preferred_comment_only(tmp_path: Path):
+    """Preferred file gets 'in preferred folder'; non-preferred kept files have no comment."""
     pref_dir = tmp_path / "pref"
     pref_dir.mkdir()
-    pref_big = make_file(pref_dir / "big.txt", "x" * 500, mtime=now - 200)  # largest, preferred
-    non_mid  = make_file(tmp_path / "mid.txt", "x" * 50,  mtime=now - 100)  # not largest
-    non_new  = make_file(tmp_path / "new.txt", "x" * 10,  mtime=now)        # newest, not preferred
+    pref_file = make_file(pref_dir / "big.txt", "x" * 500)
+    non_file  = make_file(tmp_path / "other.txt", "x" * 10)
 
-    # cli_file = pref_big (it's in pref_dir but also the cli reference)
     groups = build_near_dupe_groups(
-        cli_files={pref_big},
-        locate_map={pref_big: [non_mid, non_new]},
+        cli_files={pref_file},
+        locate_map={pref_file: [non_file]},
         fdupes_groups=[],
         preferred=[str(pref_dir)],
     )
     by_path = {e.path: e for e in groups[0]}
-    assert by_path[pref_big].action == "keep"
-    assert "in preferred folder" in by_path[pref_big].comment
-    assert "largest in basename group" not in by_path[pref_big].comment  # pref covered it
-    assert by_path[non_new].action  == "keep"     # overall newest, not in pref
-    assert "newest in basename group" in by_path[non_new].comment
-    assert by_path[non_mid].action  == "DELETE"   # covered on both dimensions
+    assert by_path[pref_file].action == "keep"
+    assert by_path[pref_file].comment == "in preferred folder"
+    assert by_path[non_file].action == "keep"
+    assert by_path[non_file].comment == ""
 
 
 def test_build_near_dupe_groups_cli_first_in_output(tmp_path: Path):
@@ -800,7 +732,7 @@ def test_write_tsv_near_dupe_section_has_comment(tmp_path: Path):
     write_tsv(exact_groups, tsv, near_dupe_groups=near_groups)
 
     content = tsv.read_text()
-    assert "NEAR-DUPLICATES" in content
+    assert "BASENAME MATCHES" in content
 
 
 def test_read_tsv_skips_comment_lines(tmp_path: Path):
@@ -808,7 +740,7 @@ def test_read_tsv_skips_comment_lines(tmp_path: Path):
     tsv.write_text(
         "Action\tSimilarity\tSize_KB\tModified\tPath\n"
         "\n"
-        "#\t\t\t\tNEAR-DUPLICATES — same basename, not byte-identical\n"
+        "#\t\t\t\tBASENAME MATCHES — same basename, not byte-identical\n"
         "\n"
         "keep\t100\t1.0\t2024-01-01T00:00:00\t/a/file.txt\n"
     )
@@ -874,11 +806,8 @@ def test_e2e_locate_all_near_dupe_similarity_codes(tmp_path: Path, cfg: Path):
     assert nd_bin[0][1].similarity == "!!!"  # binary, different size
 
 
-def test_e2e_locate_all_keeps_largest_and_newest_not_cli(tmp_path: Path, cfg: Path):
-    """
-    When the CLI file is neither the largest nor the newest among non-preferred files,
-    it gets DELETE.
-    """
+def test_e2e_locate_all_all_kept_by_default(tmp_path: Path, cfg: Path):
+    """All basename matches are kept by default — including the CLI file."""
     now = time.time()
     cli_file  = make_file(tmp_path / "cli.txt",  "x" * 10,  mtime=now - 200)
     big_file  = make_file(tmp_path / "big.txt",  "x" * 500, mtime=now - 100)
@@ -891,7 +820,7 @@ def test_e2e_locate_all_keeps_largest_and_newest_not_cli(tmp_path: Path, cfg: Pa
         preferred=[],
     )
     by_path = {e.path: e.action for e in groups[0]}
-    assert by_path[cli_file] == "DELETE"
+    assert by_path[cli_file] == "keep"
     assert by_path[big_file] == "keep"
     assert by_path[new_file] == "keep"
 
@@ -899,6 +828,280 @@ def test_e2e_locate_all_keeps_largest_and_newest_not_cli(tmp_path: Path, cfg: Pa
 def test_e2e_locate_all_help_shows_flag(tmp_path: Path, cfg: Path):
     result = run_tdupes("--help", config=cfg)
     assert "-L" in result.stdout or "locate-all" in result.stdout
+
+
+# ── Unit: build_near_dupe_groups with -X / -N / -Z flags ─────────────────────
+
+def test_build_near_dupe_groups_delete_xxx_flag(tmp_path: Path):
+    """With delete_xxx=True, non-preferred XXX-similarity files get DELETE."""
+    cli  = tmp_path / "cli.bin"
+    near = tmp_path / "near.bin"
+    cli.write_bytes(b"\x00\x01\x02\x03")   # binary
+    near.write_bytes(b"\x04\x05\x06\x07")  # binary, same size → XXX
+
+    groups = build_near_dupe_groups(
+        cli_files={cli},
+        locate_map={cli: [near]},
+        fdupes_groups=[],
+        preferred=[],
+        delete_xxx=True,
+    )
+    by_path = {e.path: e.action for e in groups[0]}
+    assert by_path[cli]  == "keep"    # cli ref has sim "100", never deleted
+    assert by_path[near] == "DELETE"  # XXX → deleted by flag
+
+
+def test_build_near_dupe_groups_delete_nnn_flag(tmp_path: Path):
+    """With delete_nnn=True, non-preferred NNN-similarity text files get DELETE."""
+    cli  = make_file(tmp_path / "cli.txt",  "hello world\n" * 10)
+    near = make_file(tmp_path / "near.txt", "hello world\n" * 5 + "goodbye\n" * 5)
+
+    groups = build_near_dupe_groups(
+        cli_files={cli},
+        locate_map={cli: [near]},
+        fdupes_groups=[],
+        preferred=[],
+        delete_nnn=True,
+    )
+    by_path = {e.path: e.action for e in groups[0]}
+    assert by_path[cli]  == "keep"
+    assert by_path[near] == "DELETE"  # NNN% text match → deleted by flag
+
+
+def test_build_near_dupe_groups_delete_excl_flag(tmp_path: Path):
+    """With delete_excl=True, non-preferred !!!-similarity files get DELETE."""
+    cli  = tmp_path / "cli.bin"
+    near = tmp_path / "near.bin"
+    cli.write_bytes(b"\x00\x01\x02\x03")        # 4 bytes
+    near.write_bytes(b"\x00\x01\x02\x03\x04")   # 5 bytes → different size → !!!
+
+    groups = build_near_dupe_groups(
+        cli_files={cli},
+        locate_map={cli: [near]},
+        fdupes_groups=[],
+        preferred=[],
+        delete_excl=True,
+    )
+    by_path = {e.path: e.action for e in groups[0]}
+    assert by_path[cli]  == "keep"
+    assert by_path[near] == "DELETE"  # !!! → deleted by flag
+
+
+def test_build_near_dupe_groups_preferred_overrides_delete_flag(tmp_path: Path):
+    """Preferred files are never deleted even when a delete flag matches their sim code."""
+    pref_dir = tmp_path / "pref"
+    pref_dir.mkdir()
+    pref_file = pref_dir / "f.bin"
+    cli       = tmp_path / "cli.bin"
+    pref_file.write_bytes(b"\x00\x01\x02\x03")
+    cli.write_bytes(b"\x04\x05\x06\x07")  # binary, same size as pref → XXX
+
+    groups = build_near_dupe_groups(
+        cli_files={cli},
+        locate_map={cli: [pref_file]},
+        fdupes_groups=[],
+        preferred=[str(pref_dir)],
+        delete_xxx=True,
+    )
+    by_path = {e.path: e.action for e in groups[0]}
+    assert by_path[pref_file] == "keep"   # preferred overrides -X
+
+
+# ── Unit: _default_system_preferred ──────────────────────────────────────────
+
+def test_default_system_preferred_excludes_home_and_tmp():
+    dirs = _default_system_preferred()
+    assert "/home" not in dirs
+    assert "/tmp" not in dirs
+    # Should include at least some system dirs on any standard Linux system
+    assert len(dirs) > 0
+    # All returned entries should be absolute paths under /
+    for d in dirs:
+        assert d.startswith("/")
+
+
+# ── E2E: -r / --remove-prefer flag ───────────────────────────────────────────
+
+def test_e2e_remove_prefer_removes_protection(tmp_path: Path, cfg: Path):
+    """With -r, a preferred dir from config loses its protection for this run."""
+    pref_dir = tmp_path / "important"
+    pref_dir.mkdir()
+    content = "same content"
+    pref_file = make_file(pref_dir / "file.txt", content)
+    other     = make_file(tmp_path / "other.txt", content)
+
+    # Config sets pref_dir as preferred
+    cfg.write_text(yaml.dump({**DEFAULT_CONFIG, "preferred_directories": [str(pref_dir)]}))
+    tsv_path = tmp_path / "out.tsv"
+
+    # Without -r: pref_file is kept
+    run_tdupes("--batch", "--tsv", str(tsv_path), str(tmp_path), config=cfg)
+    rows = read_tsv(tsv_path)
+    by_path = {p: a for a, p in rows}
+    assert by_path.get(str(pref_file)) == "keep"
+
+    # With -r: protection removed, pref_file may be deleted
+    tsv_path2 = tmp_path / "out2.tsv"
+    run_tdupes("--batch", "--tsv", str(tsv_path2),
+               "--remove-prefer", str(pref_dir),
+               str(tmp_path), config=cfg)
+    rows2 = read_tsv(tsv_path2)
+    by_path2 = {p: a for a, p in rows2}
+    # Without preferred protection, one file will be keep and one DELETE (last-in-group)
+    actions = set(by_path2.values())
+    assert "DELETE" in actions  # at least one file is now marked DELETE
+
+
+# ── E2E: -s / -S / -r flags in --help ────────────────────────────────────────
+
+def test_e2e_new_flags_in_help(tmp_path: Path, cfg: Path):
+    result = run_tdupes("--help", config=cfg)
+    assert "-s" in result.stdout or "system-prefer" in result.stdout
+    assert "-S" in result.stdout or "no-system-prefer" in result.stdout
+    assert "-r" in result.stdout or "remove-prefer" in result.stdout
+    assert "-X" in result.stdout or "delete-xxx" in result.stdout
+    assert "-N" in result.stdout or "delete-nnn" in result.stdout
+    assert "-Z" in result.stdout or "delete-excl" in result.stdout
+    assert "-A" in result.stdout or "heuristic-a" in result.stdout
+    assert "-B" in result.stdout or "heuristic-b" in result.stdout
+
+
+# ── Unit: heuristic -A (largest + newest) ────────────────────────────────────
+
+def test_heuristic_a_keeps_largest_and_newest(tmp_path: Path):
+    now = time.time()
+    cli   = make_file(tmp_path / "cli.txt",   "a" * 10,  mtime=now - 200)
+    large = make_file(tmp_path / "large.txt", "b" * 300, mtime=now - 100)
+    new_  = make_file(tmp_path / "new.txt",   "c" * 50,  mtime=now)
+
+    groups = build_near_dupe_groups(
+        cli_files={cli}, locate_map={cli: [large, new_]},
+        fdupes_groups=[], preferred=[], heuristic_a=True,
+    )
+    by_path = {e.path: e.action for e in groups[0]}
+    assert by_path[large] == "keep"    # overall largest
+    assert by_path[new_]  == "keep"    # overall newest
+    assert by_path[cli]   == "DELETE"  # neither largest nor newest
+
+
+def test_heuristic_a_preferred_covers_largest_no_extra_keeper(tmp_path: Path):
+    """If preferred file is the overall largest, no extra non-preferred copy kept for size."""
+    now = time.time()
+    pref_dir = tmp_path / "pref"
+    pref_dir.mkdir()
+    pref_big  = make_file(pref_dir / "big.txt",   "x" * 500, mtime=now - 200)
+    non_small = make_file(tmp_path  / "small.txt", "x" * 10,  mtime=now - 100)
+    non_new   = make_file(tmp_path  / "new.txt",   "x" * 50,  mtime=now)
+
+    groups = build_near_dupe_groups(
+        cli_files={pref_big}, locate_map={pref_big: [non_small, non_new]},
+        fdupes_groups=[], preferred=[str(pref_dir)], heuristic_a=True,
+    )
+    by_path = {e.path: e for e in groups[0]}
+    assert by_path[pref_big].action  == "keep"    # preferred always kept
+    assert by_path[non_new].action   == "keep"    # newest non-preferred
+    assert by_path[non_small].action == "DELETE"  # not largest, not newest
+
+
+def test_heuristic_a_comments(tmp_path: Path):
+    now = time.time()
+    cli   = make_file(tmp_path / "cli.txt",   "a" * 10,  mtime=now - 200)
+    large = make_file(tmp_path / "large.txt", "b" * 300, mtime=now - 100)
+    new_  = make_file(tmp_path / "new.txt",   "c" * 50,  mtime=now)
+
+    groups = build_near_dupe_groups(
+        cli_files={cli}, locate_map={cli: [large, new_]},
+        fdupes_groups=[], preferred=[], heuristic_a=True,
+    )
+    by_path = {e.path: e.comment for e in groups[0]}
+    assert "largest in basename group" in by_path[large]
+    assert "newest in basename group"  in by_path[new_]
+    assert by_path[cli] == ""  # deleted, no keep reason
+
+
+def test_heuristic_a_winner_gets_both_tags(tmp_path: Path):
+    """When one file is both largest and newest it gets both tags."""
+    now    = time.time()
+    cli    = make_file(tmp_path / "cli.txt",    "x" * 10,  mtime=now - 200)
+    winner = make_file(tmp_path / "winner.txt", "x" * 500, mtime=now)
+
+    groups = build_near_dupe_groups(
+        cli_files={cli}, locate_map={cli: [winner]},
+        fdupes_groups=[], preferred=[], heuristic_a=True,
+    )
+    winner_comment = next(e.comment for e in groups[0] if e.path == winner)
+    assert "largest in basename group" in winner_comment
+    assert "newest in basename group"  in winner_comment
+
+
+# ── Unit: heuristic -B (shallowest path) ─────────────────────────────────────
+
+def test_heuristic_b_keeps_shallowest(tmp_path: Path):
+    # Two depth levels: top-level vs nested
+    (tmp_path / "sub").mkdir()
+    shallow = make_file(tmp_path / "file.txt", "a")
+    deep    = make_file(tmp_path / "sub" / "file2.txt", "b")
+
+    groups = build_near_dupe_groups(
+        cli_files={shallow}, locate_map={shallow: [deep]},
+        fdupes_groups=[], preferred=[], heuristic_b=True,
+    )
+    by_path = {e.path: e.action for e in groups[0]}
+    assert by_path[shallow] == "keep"    # shallowest
+    assert by_path[deep]    == "DELETE"
+
+
+def test_heuristic_b_tie_both_kept(tmp_path: Path):
+    """Two files at the same depth both survive."""
+    f1 = make_file(tmp_path / "a.txt", "hello")
+    f2 = make_file(tmp_path / "b.txt", "world")  # same depth as f1
+
+    groups = build_near_dupe_groups(
+        cli_files={f1}, locate_map={f1: [f2]},
+        fdupes_groups=[], preferred=[], heuristic_b=True,
+    )
+    by_path = {e.path: e.action for e in groups[0]}
+    assert by_path[f1] == "keep"
+    assert by_path[f2] == "keep"
+
+
+def test_heuristic_b_comment(tmp_path: Path):
+    f1 = make_file(tmp_path / "a.txt", "hello")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    f2 = make_file(sub / "b.txt", "world")
+
+    groups = build_near_dupe_groups(
+        cli_files={f1}, locate_map={f1: [f2]},
+        fdupes_groups=[], preferred=[], heuristic_b=True,
+    )
+    by_path = {e.path: e for e in groups[0]}
+    assert "shallowest path in group" in by_path[f1].comment
+    assert by_path[f2].action == "DELETE"
+
+
+# ── Unit: heuristics combined ─────────────────────────────────────────────────
+
+def test_heuristic_ab_union_keeps_both(tmp_path: Path):
+    """Files elected by either heuristic survive; others are deleted."""
+    now = time.time()
+    # cli is the reference; large is largest; shallow is at same depth as cli
+    (tmp_path / "sub").mkdir()
+    cli   = make_file(tmp_path / "cli.txt",          "a" * 10,  mtime=now - 300)
+    large = make_file(tmp_path / "sub" / "large.txt","b" * 500, mtime=now - 100)
+    new_  = make_file(tmp_path / "sub" / "new.txt",  "c" * 50,  mtime=now)
+
+    groups = build_near_dupe_groups(
+        cli_files={cli}, locate_map={cli: [large, new_]},
+        fdupes_groups=[], preferred=[], heuristic_a=True, heuristic_b=True,
+    )
+    by_path = {e.path: e.action for e in groups[0]}
+    # cli: shallowest path (heuristic_b) → keep
+    # large: heuristic_a (largest) → keep
+    # new_: heuristic_a (newest) → keep
+    assert by_path[cli]   == "keep"
+    assert by_path[large] == "keep"
+    assert by_path[new_]  == "keep"
 
 
 # ── E2E: -p / --prefer runtime flag ──────────────────────────────────────────
