@@ -1,0 +1,13 @@
+LICENSE
+README.md
+pyproject.toml
+setup.py
+tdupes/__init__.py
+tdupes/__main__.py
+tdupes.egg-info/PKG-INFO
+tdupes.egg-info/SOURCES.txt
+tdupes.egg-info/dependency_links.txt
+tdupes.egg-info/entry_points.txt
+tdupes.egg-info/requires.txt
+tdupes.egg-info/top_level.txt
+tests/test_tdupes.py
