@@ -800,7 +800,7 @@ def test_write_tsv_near_dupe_section_has_comment(tmp_path: Path):
     write_tsv(exact_groups, tsv, near_dupe_groups=near_groups)
 
     content = tsv.read_text()
-    assert "# Near-duplicates" in content
+    assert "NEAR-DUPLICATES" in content
 
 
 def test_read_tsv_skips_comment_lines(tmp_path: Path):
@@ -808,7 +808,7 @@ def test_read_tsv_skips_comment_lines(tmp_path: Path):
     tsv.write_text(
         "Action\tSimilarity\tSize_KB\tModified\tPath\n"
         "\n"
-        "# Near-duplicates — same basename, not byte-identical\n"
+        "#\t\t\t\tNEAR-DUPLICATES — same basename, not byte-identical\n"
         "\n"
         "keep\t100\t1.0\t2024-01-01T00:00:00\t/a/file.txt\n"
     )

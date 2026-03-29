@@ -2,8 +2,21 @@
 """
 tdupes - Find and manage duplicate files.
 
-Uses fdupes to identify duplicates, generates a reviewable TSV,
-and trashes confirmed duplicates with gio trash.
+Scans files and directories for exact duplicates (via fdupes) and, optionally,
+near-duplicates sharing the same basename (via plocate/locate).  Results are
+written to a TSV that can be reviewed and edited before any files are touched.
+Confirmed deletions are sent to the system trash via gio trash, so nothing is
+irrecoverably lost until the bin is emptied.
+
+Features
+--------
+* Exact-duplicate detection via fdupes (byte-identical, any mix of files/dirs)
+* Near-duplicate detection via -L (same basename, scored by similarity)
+* Preferred-directory protection: files inside preferred dirs are never proposed to be deleted by default
+* Exclusion patterns: skip files matching shell glob patterns
+* Interactive review: TSV opened with xdg-open; edit Action column, then confirm
+* Batch mode: no prompts, immediate execution (suitable for scripting/cron)
+* Safe deletion: gio trash keeps files recoverable
 """
 from __future__ import annotations
 
@@ -53,7 +66,15 @@ _REQUIRED_BINS = {
     "gio":       "gio (GVfs)      →  sudo apt install gvfs-bin",
     "xdg-open":  "xdg-open        →  sudo apt install xdg-utils",
 }
-_LOCATE_LABEL = "locate          →  sudo apt install plocate"
+_LOCATE_LABEL = "plocate/locate  →  sudo apt install plocate"
+
+
+def _locate_binary() -> str | None:
+    """Return the best available locate binary: plocate preferred over locate."""
+    for binary in ("plocate", "locate"):
+        if shutil.which(binary):
+            return binary
+    return None
 
 
 def check_dependencies(need_locate: bool) -> list[str]:
@@ -63,7 +84,7 @@ def check_dependencies(need_locate: bool) -> list[str]:
     for binary, label in _REQUIRED_BINS.items():
         if not shutil.which(binary):
             missing.append(label)
-    if need_locate and not shutil.which("locate"):
+    if need_locate and _locate_binary() is None:
         missing.append(_LOCATE_LABEL)
     return missing
 
@@ -141,15 +162,16 @@ def locate_by_basenames(cli_files: set[Path]) -> dict[Path, list[Path]]:
     for cf in cli_files:
         by_name.setdefault(cf.name, []).append(cf)
 
+    binary = _locate_binary() or "locate"
     patterns = [f"\\{name}" for name in by_name]
     try:
         result = subprocess.run(
-            ["locate", "-b"] + patterns,
+            [binary, "-b"] + patterns,
             capture_output=True,
             text=True,
         )
     except Exception as exc:
-        eprint(f"[locate] warning: {exc}")
+        eprint(f"[{binary}] warning: {exc}")
         return {cf: [] for cf in cli_files}
 
     # Map results back: a result line belongs to every cli_file with that basename.

@@ -55,3 +55,5 @@ Finally, he usage of locate via shutil is slow when there are hundreds of files.
 --
 I notice fdupes only accepts directories as arguments which is why it did not work as anticipated in my testing. How can we ensure also individual files get considered in the exact duplicate matching? In theory we could temporarily hard link them into a temporary folder and give that as an argument, but then if there are multiple arguments with the same basename those would have to be placed in separate folders within this temporary directory.
 Also, I do not like the "# Near-d"... section separator so I tweaked it a bit.
+--
+I notice plocate is mentioned in the files but locate is still used. Is something left half-done? Should it automatically use locate only when plocate is not available? Can you also update the documentation, especially the short project summaries to match the tool's current status and nature.

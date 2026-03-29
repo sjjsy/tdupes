@@ -1,9 +1,25 @@
 # tdupes
 
-Find and manage duplicate files on Linux.
+Find, review, and safely trash exact and near-duplicate files on Linux.
 
-`tdupes` uses `fdupes` to locate exact duplicates, produces a reviewable TSV,
-then trashes confirmed deletions via `gio trash` so nothing is irrecoverably lost.
+`tdupes` detects **exact duplicates** (byte-identical, via `fdupes`) and
+optionally **near-duplicates** (same basename, scored by content similarity, via
+`plocate`/`locate`).  Results are written to a TSV that you review and edit with
+your favourite spreadsheet tool before any files are touched; confirmed deletions
+go to `gio trash` and remain recoverable until the bin is emptied.
+
+Key features:
+
+* Accepts any mix of individual files and directories as arguments
+* Near-duplicate detection with `-L`: for files given as arguments it
+  finds same-basename files across the filesystem, with a similarity
+  score (text %, binary same/different size)
+* Preferred-directory protection — files inside configured dirs are never
+  proposed to be deleted by default
+* Preferred dirs and exclusion patterns can be specified by config file
+  or via `-p`/`-x` flags upon execution
+* Interactive action plan editing (TSV opened with `xdg-open`) or fully
+  automated batch mode (with the TSV merely as the log)
 
 ## Install
 

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tdupes"
 version = "0.3.0"
-description = "Find and manage duplicate files using fdupes"
+description = "Find, review, and safely trash duplicate and near-duplicate files"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.8"
@@ -20,7 +20,7 @@ classifiers = [
     "Topic :: Utilities",
     "Topic :: System :: Filesystems",
 ]
-keywords = ["duplicates", "fdupes", "deduplication", "files"]
+keywords = ["duplicates", "fdupes", "deduplication", "files", "near-duplicates", "locate", "plocate", "trash"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
